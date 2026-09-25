@@ -4732,29 +4732,37 @@ pub async fn virtual_non_remote_owns_name_version(
     Ok(pypi_version_owned(version, &stored_versions))
 }
 
-/// Exact-version variant of [`virtual_non_remote_owns_name`] for formats whose
-/// version is an opaque string compared byte-for-byte (npm semver: `1.0.0`
-/// and `1.0.0-next.3` are distinct versions, and `artifacts.version` holds the
-/// string npm published). The guard fires only when a non-Remote member owns
-/// this exact `name@version` — the dependency-confusion case it exists for —
-/// so a hosted member holding one fork build of a name no longer suppresses
-/// every upstream version of that name on the download path (#3646): the
-/// virtual packument merge (#2844) advertises those versions, so the tarball
-/// leg must resolve them too.
+/// Exact-version variant of the npm shadowing guard, made priority-aware by
+/// #3955: returns `Some(min_priority)` — the smallest
+/// `virtual_repo_members.priority` among the non-Remote members owning this
+/// exact `name@version` — or `None` when no non-Remote member owns it.
+/// (`artifacts.version` holds the exact string npm published: `1.0.0` and
+/// `1.0.0-next.3` are distinct versions, compared byte-for-byte.)
 ///
-/// [`virtual_non_remote_owns_name_version`] is not reusable here: its PEP 440
-/// equality cannot parse the prerelease tags npm allows but PEP 440 does not
-/// (`-next.3`, `-canary.1`, a fork's `-myorg.1`) and fails safe to name-only
-/// suppression for them, which is exactly the 404 this closes.
+/// The caller must then decide suppression PER REMOTE MEMBER, exactly as the
+/// PyPI PEP 708 isolation does (#2311, see [`pypi_virtual_isolates_name`]): a
+/// Remote member `R` is suppressed only when an owning non-Remote member
+/// OUTRANKS it (`min_priority < R.priority`). A Remote member ranked at or
+/// above every owner still surfaces — the operator explicitly placed the
+/// upstream there, and the merged packument (#2844) already advertises that
+/// winner's `dist.integrity` for the version. Suppressing it anyway made the
+/// two legs of the virtual disagree: the packument pointed npm at the
+/// upstream's SRI digest while the tarball route served the hosted member's
+/// bytes, and npm failed with EINTEGRITY (#3955).
+///
+/// The version-aware shape (rather than name-only) is #3646's: a hosted
+/// member holding one fork build of a name suppresses Remote members only
+/// for the version it actually owns, so every upstream version the merged
+/// packument advertises stays downloadable.
 ///
 /// Fails closed on DB error (matches [`virtual_non_remote_owns_name`]).
 #[allow(clippy::result_large_err)]
-pub async fn virtual_non_remote_owns_name_exact_version(
+pub async fn npm_virtual_owner_min_priority(
     db: &PgPool,
     virtual_repo_id: Uuid,
     package_name: &str,
     version: &str,
-) -> Result<bool, Response> {
+) -> Result<Option<i32>, Response> {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
     let non_remote_ids: Vec<Uuid> = members
         .iter()
@@ -4763,24 +4771,32 @@ pub async fn virtual_non_remote_owns_name_exact_version(
         .collect();
 
     if non_remote_ids.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
 
-    let exists = sqlx::query(
-        "SELECT 1 FROM artifacts \
-         WHERE repository_id = ANY($1) \
-           AND is_deleted = false \
-           AND LOWER(name) = LOWER($2) \
-           AND version = $3 \
-         LIMIT 1",
+    // Which non-Remote members own this exact name@version, and at what
+    // member priority? Joined against `virtual_repo_members` — the same
+    // table `fetch_virtual_member_priorities` reads — so the ownership and
+    // the priority the caller compares it against cannot drift apart.
+    let owning: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT DISTINCT a.repository_id, vrm.priority \
+         FROM artifacts a \
+         INNER JOIN virtual_repo_members vrm \
+                 ON vrm.member_repo_id = a.repository_id \
+                AND vrm.virtual_repo_id = $4 \
+         WHERE a.repository_id = ANY($1) \
+           AND a.is_deleted = false \
+           AND LOWER(a.name) = LOWER($2) \
+           AND a.version = $3",
     )
     .bind(&non_remote_ids)
     .bind(package_name)
     .bind(version)
-    .fetch_optional(db)
+    .bind(virtual_repo_id)
+    .fetch_all(db)
     .await
     .map_err(|e| shadowing_guard_db_err(virtual_repo_id, "npm", e))?;
-    Ok(exists.is_some())
+    Ok(owning.iter().map(|(_, priority)| *priority).min())
 }
 
 /// Decide whether `requested` matches any of the locally-owned `stored`
